@@ -1,0 +1,804 @@
+﻿// ==UserScript==
+// @name         Copilot Persian Display Enhancer — Advanced RTL Engine (Final v6.3)
+// @namespace    pardis.rtl.panel.v6.3
+// @version      6.3
+// @description  پنل تطبیقی با تشخیص زبان هوشمند، تایپوگرافی پیشرفته، ابزار دیباگ، پلاگین، داک/درگ و مدیریت پروفایل‌ها (دستی+خودکار)
+// @include      *://*/*
+// @run-at       document-end
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @connect      fonts.googleapis.com
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ------------------------------
+     Storage helpers (GM-compatible)
+     ------------------------------ */
+  const KEY_PREFS = 'cp_rtl_prefs_v6_3';
+  const KEY_BTN_POS = 'cp_rtl_btn_pos_v6_3';
+  const KEY_PANEL_POS = 'cp_rtl_panel_pos_v6_3';
+  const KEY_PLUGINS = 'cp_plugins_v6_3';
+  const KEY_PROFILES = 'cp_profiles_v6_3';
+  const KEY_SELECTED_PROFILE = 'cp_selected_profile_v6_3';
+  const FONT_CDN = 'https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100;200;300;400;500;600;700;800;900&display=swap';
+
+  function safeSet(key, val) {
+    try {
+      const s = JSON.stringify(val);
+      if (typeof GM_setValue === 'function') return GM_setValue(key, s);
+      localStorage.setItem(key, s);
+    } catch (e) { console.error('safeSet', e); }
+  }
+  function safeGet(key, def = null) {
+    try {
+      const raw = (typeof GM_getValue === 'function') ? GM_getValue(key) : localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : def;
+    } catch (e) { return def; }
+  }
+
+  /* ------------------------------
+     Defaults and prefs
+     ------------------------------ */
+  const defaultPrefs = {
+    font: 'Vazirmatn, sans-serif',
+    fontSize: 16,
+    lineHeight: 1.8,
+    fontWeight: 400,
+    letterSpacing: 'normal',
+    textAlign: 'justify',
+    panelVisible: true,
+    autoApply: true,
+    compactMode: false,
+    customSelectors: 'p, div, span, li, td, h1, h2, h3, h4, h5, h6',
+    languageDetection: 'hybrid',
+    manualOverrides: {},
+    livePreview: true,
+    performanceMode: true,
+    autoScan: false
+  };
+  let prefs = Object.assign({}, defaultPrefs, safeGet(KEY_PREFS, {}));
+
+  /* ------------------------------
+     Small DOM helpers
+     ------------------------------ */
+  const $ = (s, root = document) => root.querySelector(s);
+  const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const truncate = (s, n = 80) => s && s.length > n ? s.slice(0, n - 1) + '…' : s;
+
+  /* ------------------------------
+     Language detection (simple)
+     ------------------------------ */
+  function detectTextLanguage(text) {
+    if (!text || text.length < 3) return 'neutral';
+    const clean = text.replace(/https?:\/\/\S+/g, '').replace(/<[^>]+>/g, '').replace(/[0-9.,;:!?()\[\]{}"'\-–—]/g, '').replace(/\s+/g, ' ').trim();
+    if (clean.length < 3) return 'neutral';
+    const pers = (clean.match(/[\u0600-\u06FF]/g) || []).length;
+    const eng = (clean.match(/[A-Za-z]/g) || []).length;
+    const total = pers + eng;
+    if (!total) return 'neutral';
+    const pr = pers / total, er = eng / total;
+    if (Math.abs(pr - er) < 0.15) return 'mixed';
+    return pr > er ? 'persian' : 'english';
+  }
+
+  /* ------------------------------
+     Context awareness (simple)
+     ------------------------------ */
+  function analyzePageContext() {
+    const pageTitle = document.title || '';
+    const isBlog = /blog|article|post|مطلب|مقاله|بلاگ/i.test(pageTitle) || !!document.querySelector('article, .post, .blog-post, .article, [class*="content"]');
+    const isForum = /forum|discussion|comment|انجمن|بحث|نظر/i.test(pageTitle) || !!document.querySelector('.forum, .comments, .thread, .discussion');
+    const isEcommerce = /shop|store|product|cart|فروشگاه|محصول|سبد|خرید/i.test(pageTitle) || !!document.querySelector('.product, .cart, .price, .shop, .store');
+    const isSocial = /social|media|network|اجتماعی|شبکه|پست/i.test(pageTitle) || !!document.querySelector('.post, .feed, .timeline, .social');
+    return { type: isBlog ? 'blog' : isForum ? 'forum' : isEcommerce ? 'ecommerce' : isSocial ? 'social' : 'general', hasPersianContent: /[\u0600-\u06FF]/.test(document.body?.textContent || '') };
+  }
+  function contextSettingsFor(type) {
+    const map = {
+      blog: { lineHeight: Math.max(prefs.lineHeight, 1.8), fontSize: Math.max(prefs.fontSize, 16), textAlign: 'justify' },
+      forum: { lineHeight: Math.max(prefs.lineHeight, 1.6), fontSize: Math.max(prefs.fontSize, 14), textAlign: 'right' },
+      ecommerce: { lineHeight: Math.max(prefs.lineHeight, 1.5), fontSize: Math.max(prefs.fontSize, 15), textAlign: 'right' },
+      social: { lineHeight: Math.max(prefs.lineHeight, 1.7), fontSize: Math.max(prefs.fontSize, 15), textAlign: 'right' },
+      general: { lineHeight: prefs.lineHeight, fontSize: prefs.fontSize, textAlign: prefs.textAlign }
+    };
+    return map[type] || map.general;
+  }
+
+  /* ------------------------------
+     Plugin system (minimal, persistent)
+     ------------------------------ */
+  const pluginSystem = {
+    plugins: [], // runtime objects
+    saved: safeGet(KEY_PLUGINS, null) || [
+      { kind: 'builtin', id: 'math', enabled: true },
+      { kind: 'builtin', id: 'persian-date', enabled: true }
+    ],
+    ctx: null,
+
+    init(ctx) {
+      this.ctx = ctx;
+      // no immediate UI here; attachUI called from panel creation
+    },
+
+    register(plugin, meta = {}) {
+      if (!plugin || typeof plugin !== 'object') return;
+      if (meta.id) plugin.__id = meta.id;
+      if (meta.url) plugin.__url = meta.url;
+      plugin.disabled = !!plugin.disabled;
+      this.plugins.push(plugin);
+      try { if (typeof plugin.init === 'function') plugin.init(); } catch (e) { console.warn('plugin init', e); }
+      this.renderList();
+    },
+
+    applyPlugins(el, context) {
+      for (const p of this.plugins) {
+        if (!p.disabled && typeof p.processElement === 'function') {
+          try { p.processElement(el, context); } catch (e) {}
+        }
+      }
+    },
+
+    persist() { safeSet(KEY_PLUGINS, this.saved); },
+
+    // For brevity: load builtins and url plugins (similar approach as previous versions)
+    async restore() {
+      const builtinMap = {
+        'math': () => ({ name: 'پردازش فرمول‌های ریاضی', description: 'تشخیص LaTeX/$$', processElement(el){ const t = el.textContent || ''; if (/\$\$|\\\(|\\\[|\\begin\{equation\}/.test(t)){ el.classList.add('has-math-formula'); try{ el.style.backgroundColor='rgba(255,240,180,0.25)'; }catch{} } } }),
+        'persian-date': () => ({ name: 'تاریخ‌های شمسی', description: 'تشخیص تاریخ', processElement(el){ const t = el.textContent||''; if (/\d{1,2}\/\d{1,2}\/\d{4}|\d{4}\/\d{1,2}\/\d{1,2}|[۰-۹]{1,2}\/[۰-۹]{1,2}\/[۰-۹]{4}/.test(t)){ el.classList.add('has-persian-date'); try{ el.style.backgroundColor='rgba(180,240,255,0.25)'; }catch{} } } })
+      };
+      for (const s of this.saved) {
+        if (s.kind === 'builtin' && builtinMap[s.id]) {
+          const inst = builtinMap[s.id]();
+          inst.__id = s.id;
+          inst.disabled = !s.enabled;
+          this.register(inst, { id: s.id });
+        }
+        // url plugins loading omitted for brevity; attachUI supports adding URL plugins
+      }
+      this.renderList();
+    },
+
+    attachUI(container) {
+      if (!container) return;
+      container.innerHTML = `
+        <div id="cp-plugins-list" style="margin-bottom:8px"></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input id="cp-plugin-url" placeholder="https://example.com/plugin.js" style="flex:1;padding:6px" />
+          <button id="cp-add-plugin" style="padding:6px">افزودن از URL</button>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button id="cp-save-plugins" style="padding:6px">ذخیره</button>
+          <button id="cp-clear-plugins" style="padding:6px">پاک کردن ذخیره</button>
+        </div>
+      `;
+      const listEl = $('#cp-plugins-list');
+      const renderInner = () => {
+        if (!listEl) return;
+        if (!this.plugins.length) { listEl.innerHTML = '<p style="color:#666">هیچ پلاگینی نصب نشده</p>'; return; }
+        listEl.innerHTML = this.plugins.map((p,i)=>`<div style="border:1px solid #eee;padding:8px;border-radius:6px;margin-bottom:6px;display:flex;justify-content:space-between"><div><b>${truncate(p.name||'plugin',40)}</b><div style="font-size:12px;color:#666">${truncate(p.description||'',80)}</div></div><div><button data-i="${i}" class="cp-p-toggle" style="padding:4px">${p.disabled?'فعال‌سازی':'غیرفعال‌سازی'}</button><button data-i="${i}" class="cp-p-remove" style="padding:4px;margin-inline-start:6px">حذف</button></div></div>`).join('');
+        $$('.cp-p-toggle', listEl).forEach(b=>b.addEventListener('click', e=>{ const i=+e.currentTarget.getAttribute('data-i'); this.plugins[i].disabled=!this.plugins[i].disabled; this.syncSaved(); this.persist(); renderInner(); }));
+        $$('.cp-p-remove', listEl).forEach(b=>b.addEventListener('click', e=>{ const i=+e.currentTarget.getAttribute('data-i'); const rem=this.plugins.splice(i,1)[0]; if (rem) this.removeFromSaved(rem); this.persist(); renderInner(); }));
+      };
+      renderInner();
+
+      container.querySelector('#cp-add-plugin').addEventListener('click', async ()=>{
+        const url = container.querySelector('#cp-plugin-url').value.trim();
+        if (!url) return;
+        try {
+          // load plugin code via GM_xmlhttpRequest or fetch and evaluate similarly to previous versions
+          let code = null;
+          if (typeof GM_xmlhttpRequest === 'function') {
+            code = await new Promise((res, rej)=>{
+              GM_xmlhttpRequest({ method:'GET', url, onload:r=>res(r.responseText), onerror:err=>rej(err) });
+            });
+          } else {
+            code = await fetch(url).then(r=>r.text());
+          }
+          // evaluate - plugin should export window.__CP_PLUGIN__ or module.exports
+          const wrapper = `(function(){ var module={exports:{}}; var exports=module.exports; window.__CP_PLUGIN__=null; (function(module,exports){ ${code}\n })(module,exports); return window.__CP_PLUGIN__ || module.exports || null; })();`;
+          let pluginObj = null;
+          try { pluginObj = new Function(wrapper)(); } catch (e) { console.warn('eval plugin', e); }
+          if (pluginObj && typeof pluginObj === 'object') {
+            pluginObj.__url = url;
+            pluginObj.disabled = false;
+            this.register(pluginObj, { url });
+            this.saved.push({ kind: 'url', url, enabled: true });
+            this.persist();
+          } else {
+            // if plugin script uses window.CPRTL_register, it should call it; save entry for next restore
+            this.saved.push({ kind: 'url', url, enabled: true });
+            this.persist();
+          }
+        } catch (e) { console.warn('load plugin url', e); }
+      });
+
+      container.querySelector('#cp-save-plugins').addEventListener('click', ()=>{ this.persist(); });
+      container.querySelector('#cp-clear-plugins').addEventListener('click', ()=>{ if(confirm('پاکسازی پلاگین‌های ذخیره‌شده؟')){ this.saved=[]; safeSet(KEY_PLUGINS,this.saved); this.plugins=[]; renderInner(); } });
+    },
+
+    syncSaved() {
+      for (const s of this.saved) {
+        if (s.kind === 'builtin') {
+          const p = this.plugins.find(x => x.__id === s.id);
+          if (p) s.enabled = !p.disabled;
+        } else if (s.kind === 'url') {
+          const p = this.plugins.find(x => x.__url === s.url);
+          if (p) s.enabled = !p.disabled;
+        }
+      }
+    },
+    removeFromSaved(plugin) {
+      const idx = this.saved.findIndex(s => (s.kind==='builtin' && s.id===plugin.__id) || (s.kind==='url' && s.url===plugin.__url));
+      if (idx>=0) this.saved.splice(idx,1);
+    },
+
+    registerGlobal(plugin) {
+      if (plugin && typeof plugin === 'object') { plugin.__url = plugin.__url || null; this.register(plugin, { url: plugin.__url }); }
+    },
+
+    renderList() { const el = document.getElementById('cp-plugins-list'); if (el) { /* no-op here, attachUI handles rendering */ } }
+  };
+
+  // allow remote plugins to call register
+  window.CPRTL_register = (p) => { try { pluginSystem.registerGlobal(p); } catch (e) { console.warn(e); } };
+
+  /* ------------------------------
+     Debug tools
+     ------------------------------ */
+  const debugTools = {
+    issues: [],
+    init(ctx) { this.ctx = ctx; }, // UI created from createPanel
+    scan() {
+      this.issues = [];
+      const els = document.querySelectorAll('p,div,span,li,h1,h2,h3,h4,h5,h6,td,th');
+      for (const el of els) {
+        if (el.closest && el.closest('#cp-panel')) continue; // skip panel itself
+        const txt = (el.textContent||'').trim();
+        if (!txt || txt.length < 2) continue;
+        try {
+          const style = getComputedStyle(el);
+          if (/[\u0600-\u06FF]/.test(txt) && style.direction !== 'rtl') this.issues.push({ element: el, type: 'direction', message: 'متن فارسی بدون RTL' });
+          if (/[\u0600-\u06FF]/.test(txt) && style.textAlign === 'left') this.issues.push({ element: el, type: 'alignment', message: 'تراز چپ برای متن فارسی' });
+          if (/[\u0600-\u06FF]/.test(txt) && /[A-Za-z]/.test(txt)) this.issues.push({ element: el, type: 'mixed', message: 'ترکیب زبان فارسی/انگلیسی' });
+          if (/[\u0600-\u06FF]/.test(txt) && !(style.fontFamily||'').match(/Vazirmatn|Iran|Tahoma|Segoe/)) this.issues.push({ element: el, type: 'font', message: 'فونت مناسب برای فارسی نیست' });
+        } catch (e) {}
+      }
+      this.render();
+      return this.issues;
+    },
+    render() {
+      const out = document.getElementById('cp-issues-result');
+      if (!out) return;
+      if (!this.issues.length) { out.innerHTML = '<p style="color:green;text-align:center">هیچ مشکلی یافت نشد</p>'; return; }
+      out.innerHTML = this.issues.map((it,idx)=> {
+        const tag = it.element.tagName.toLowerCase();
+        const cls = it.element.className ? '.'+truncate(it.element.className,40) : '';
+        const idstr = it.element.id ? '#'+it.element.id : '';
+        return `<div style="padding:6px;margin:6px 0;border-left:3px solid #e74c3c;background:#fff5f5">
+          <div style="font-size:13px">${truncate(it.message,120)}</div>
+          <div style="font-size:11px;color:#666">${tag}${cls}${idstr}</div>
+          <div style="margin-top:6px;"><button data-idx="${idx}" class="cp-issue-scroll" style="padding:4px 8px">نمایش در صفحه</button></div>
+        </div>`;
+      }).join('');
+      $$('.cp-issue-scroll', out).forEach(b=>b.addEventListener('click', e=>{
+        const idx = +e.currentTarget.getAttribute('data-idx');
+        const el = this.issues[idx].element;
+        if (el && typeof el.scrollIntoView === 'function'){ el.scrollIntoView({behavior:'smooth', block:'center'}); const old=el.style.outline; el.style.outline='3px solid #e74c3c'; setTimeout(()=>{ el.style.outline = old; }, 2000); }
+      }));
+    },
+    highlight() {
+      for (const it of this.issues) {
+        try { it.element.classList.add('cp-issue-highlight'); it.element.style.outline='2px solid #e74c3c'; } catch (e) {}
+      }
+    },
+    fixAll() {
+      for (const it of this.issues) {
+        try {
+          if (it.type === 'direction') it.element.style.direction = 'rtl';
+          if (it.type === 'alignment') it.element.style.textAlign = 'right';
+          if (it.type === 'font') it.element.style.fontFamily = prefs.font;
+          if (it.type === 'mixed') { it.element.style.direction = 'auto'; it.element.style.textAlign = 'justify'; }
+        } catch(e) {}
+      }
+      // remove highlight visuals after fixing
+      $$('.cp-issue-highlight').forEach(el=>{ el.classList.remove('cp-issue-highlight'); try{ el.style.outline=''; }catch{} });
+      this.scan();
+    }
+  };
+
+  /* ------------------------------
+     Typography core
+     ------------------------------ */
+  function applyTypography(root = document) {
+    if (!prefs.autoApply) return;
+    try {
+      const ctx = analyzePageContext();
+      const cs = contextSettingsFor(ctx.type);
+      const selectors = (prefs.customSelectors||'').split(',').map(s=>s.trim()).filter(Boolean).join(', ');
+      if (!selectors) return;
+      const nodes = (root === document) ? $$(selectors).filter(e => !e.closest || !e.closest('#cp-panel')) : $$(selectors, root);
+      for (const block of nodes) {
+        const text = block.textContent || '';
+        const id = block.id || null;
+        if (id && prefs.manualOverrides[id]) {
+          const ov = prefs.manualOverrides[id];
+          block.style.direction = ov.direction;
+          block.style.textAlign = ov.textAlign;
+        } else {
+          const lang = detectTextLanguage(text);
+          if (lang === 'persian') { block.style.direction = 'rtl'; block.style.textAlign = cs.textAlign; }
+          else if (lang === 'english') { block.style.direction = 'ltr'; block.style.textAlign = 'left'; }
+          else if (lang === 'mixed') { block.style.direction='auto'; block.style.textAlign='justify'; }
+          else { block.style.direction='auto'; block.style.textAlign='start'; }
+        }
+        try {
+          block.style.fontFamily = prefs.font;
+          block.style.fontSize = cs.fontSize + 'px';
+          block.style.lineHeight = cs.lineHeight;
+          block.style.fontWeight = prefs.fontWeight;
+          block.style.letterSpacing = prefs.letterSpacing;
+        } catch (e) {}
+        pluginSystem.applyPlugins(block, { context: ctx });
+      }
+    } catch (err) { console.error('applyTypography', err); }
+  }
+
+  /* ------------------------------
+     Draggable with careful form handling (prevents blocking selects)
+     ------------------------------ */
+  function makeDraggable(el, storageKey, opts = {}) {
+    el.style.position = 'fixed';
+    el.style.zIndex = 99999;
+    let dragging = false, startX=0, startY=0, startLeft=0, startTop=0;
+
+    function isInteractive(target) {
+      return !!(target && target.closest && target.closest('input,select,textarea,button,a,[role="button"]'));
+    }
+
+    function down(e) {
+      if (e.button !== 0) return;
+      if (isInteractive(e.target)) return; // do not start drag if interacting with inputs/selects
+      dragging = true;
+      startX = e.clientX; startY = e.clientY;
+      startLeft = parseInt(el.style.left || el.getBoundingClientRect().left, 10);
+      startTop = parseInt(el.style.top || el.getBoundingClientRect().top, 10);
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+      e.preventDefault();
+    }
+    function move(e) {
+      if (!dragging) return;
+      let nx = startLeft + (e.clientX - startX);
+      let ny = startTop + (e.clientY - startY);
+      nx = clamp(nx, 6, window.innerWidth - (el.offsetWidth||200) - 6);
+      ny = clamp(ny, 6, window.innerHeight - (el.offsetHeight||200) - 6);
+      el.style.left = nx + 'px'; el.style.top = ny + 'px';
+    }
+    function up() {
+      if (dragging) safeSet(storageKey, { left: el.style.left, top: el.style.top });
+      dragging = false;
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+    }
+    el.addEventListener('mousedown', down);
+    // touch
+    el.addEventListener('touchstart', e => {
+      const t = e.touches[0];
+      if (!t || isInteractive(e.target)) return;
+      startX = t.clientX; startY = t.clientY;
+      startLeft = parseInt(el.style.left || el.getBoundingClientRect().left,10);
+      startTop = parseInt(el.style.top || el.getBoundingClientRect().top,10);
+      function tm(ev) {
+        const tt = ev.touches[0]; if (!tt) return;
+        let nx = startLeft + (tt.clientX - startX), ny = startTop + (tt.clientY - startY);
+        nx = clamp(nx, 6, window.innerWidth - (el.offsetWidth||200)-6); ny = clamp(ny,6,window.innerHeight-(el.offsetHeight||200)-6);
+        el.style.left = nx + 'px'; el.style.top = ny + 'px';
+      }
+      function te() { safeSet(storageKey, { left: el.style.left, top: el.style.top }); document.removeEventListener('touchmove', tm); document.removeEventListener('touchend', te); }
+      document.addEventListener('touchmove', tm);
+      document.addEventListener('touchend', te);
+    });
+
+    const pos = safeGet(storageKey, null);
+    if (pos && typeof pos.left === 'string') { el.style.left = pos.left; el.style.top = pos.top; }
+    else if (opts.default) { el.style.left = opts.default.left; el.style.top = opts.default.top; }
+  }
+
+  /* ------------------------------
+     Profiles system (v6.3): manual + domain-based auto apply (silent)
+     ------------------------------ */
+  const Profiles = {
+    list: safeGet(KEY_PROFILES, null) || null, // will initialize if null
+    selected: safeGet(KEY_SELECTED_PROFILE, null),
+
+    initDefaults() {
+      if (!this.list) {
+        // create default profile
+        const defaultProfile = {
+          id: 'default',
+          name: 'پیش‌فرض',
+          settings: Object.assign({}, prefs),
+          domains: [] // domains can be added by user
+        };
+        this.list = [defaultProfile];
+        safeSet(KEY_PROFILES, this.list);
+        this.selected = 'default';
+        safeSet(KEY_SELECTED_PROFILE, this.selected);
+      }
+    },
+
+    create(name = 'پروفایل جدید') {
+      const id = 'p_' + Math.random().toString(36).slice(2,9);
+      const profile = { id, name, settings: Object.assign({}, prefs), domains: [] };
+      this.list.push(profile);
+      safeSet(KEY_PROFILES, this.list);
+      return profile;
+    },
+
+    save(profileId, newData) {
+      const idx = this.list.findIndex(p => p.id === profileId);
+      if (idx >= 0) { Object.assign(this.list[idx], newData); safeSet(KEY_PROFILES, this.list); }
+    },
+
+    delete(profileId) {
+      if (profileId === 'default') return; // prevent deleting default
+      this.list = this.list.filter(p => p.id !== profileId);
+      safeSet(KEY_PROFILES, this.list);
+      if (this.selected === profileId) { this.selected = 'default'; safeSet(KEY_SELECTED_PROFILE, this.selected); this.applyById(this.selected); }
+    },
+
+    select(profileId) {
+      const p = this.list.find(x => x.id === profileId);
+      if (!p) return;
+      this.selected = profileId;
+      safeSet(KEY_SELECTED_PROFILE, this.selected);
+      // apply profile settings silently
+      this.applyProfile(p);
+    },
+
+    applyProfile(profile) {
+      if (!profile) return;
+      // copy profile settings into prefs
+      prefs = Object.assign({}, prefs, profile.settings);
+      safeSet(KEY_PREFS, prefs);
+      // update UI controls if panel exists
+      updateUIFromPrefs();
+      // apply typography immediately
+      applyTypography(document);
+      // enable/disable plugins if profile stored plugin state (optional)
+      // silent: no alerts
+    },
+
+    applyById(id) { const p = this.list.find(x=>x.id===id); if (p) this.applyProfile(p); },
+
+    matchDomain(hostname) {
+      const matched = this.list.find(p => p.domains && p.domains.some(pattern => domainMatches(pattern, hostname)));
+      return matched || null;
+    }
+  };
+
+  // domain match helper - supports wildcard like *.example.com and plain domains and substring
+  function domainMatches(pattern, hostname) {
+    if (!pattern || !hostname) return false;
+    pattern = pattern.trim().toLowerCase();
+    hostname = hostname.toLowerCase();
+    if (pattern === hostname) return true;
+    if (pattern.startsWith('*.')) {
+      const base = pattern.slice(2);
+      return hostname === base || hostname.endsWith('.' + base);
+    }
+    // allow contains match for convenience (user-friendly)
+    return hostname === pattern || hostname.endsWith('.' + pattern) || hostname.indexOf(pattern) !== -1;
+  }
+
+  /* ------------------------------
+     Create Panel & UI
+     ------------------------------ */
+  function createPanel() {
+    // load font
+    const link = document.createElement('link'); link.rel='stylesheet'; link.href = FONT_CDN; document.head.appendChild(link);
+
+    // basic styles
+    const st = document.createElement('style');
+    st.textContent = `
+      #cp-panel{border-radius:12px;padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.15);width:420px;max-height:80vh;overflow:auto;background:#fff;color:#111;font-family:${prefs.font};position:fixed}
+      #cp-panel.compact{width:240px;padding:8px}
+      .cp-tabs{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+      .cp-tab{padding:6px 10px;border-radius:8px;background:#eef2ff;cursor:pointer;font-size:13px}
+      .cp-tab.active{background:#334155;color:#fff}
+      .cp-section{display:none}
+      .cp-section.active{display:block}
+      #cp-toggle-btn{width:42px;height:42px;border-radius:50%;border:none;position:fixed;z-index:100000;background:#64748b;color:#fff;cursor:grab;box-shadow:0 6px 18px rgba(0,0,0,.15)}
+      .cp-live-preview{border:1px dashed #ccc;padding:10px;margin:10px 0;min-height:60px}
+      .cp-issue-highlight{outline:2px solid #e74c3c}
+      .has-math-formula{font-family:${prefs.font}, 'Cambria Math', serif !important}
+      .has-persian-date{font-feature-settings:'numr' !important}
+    `;
+    document.head.appendChild(st);
+
+    // panel & toggle
+    const panel = document.createElement('div'); panel.id='cp-panel';
+    panel.style.left = '64px'; panel.style.top = '80px';
+    if (prefs.compactMode) panel.classList.add('compact');
+    panel.style.display = prefs.panelVisible ? 'block' : 'none';
+    document.body.appendChild(panel);
+
+    const toggle = document.createElement('button'); toggle.id='cp-toggle-btn'; toggle.textContent='🪄'; document.body.appendChild(toggle);
+    // restore positions
+    const bpos = safeGet(KEY_BTN_POS, null); if (bpos) { try{ toggle.style.left=bpos.left; toggle.style.top=bpos.top; }catch{} }
+    const ppos = safeGet(KEY_PANEL_POS, null); if (ppos) { try{ panel.style.left=ppos.left; panel.style.top=ppos.top; }catch{} }
+
+    // draggable (prevent blocking selects)
+    makeDraggable(toggle, KEY_BTN_POS, { default: { left: '20px', top: '80px' } });
+    makeDraggable(panel, KEY_PANEL_POS, { default: { left: '80px', top: '80px' } });
+
+    // toggle behavior
+    toggle.addEventListener('click', () => { prefs.panelVisible = !prefs.panelVisible; panel.style.display = prefs.panelVisible ? 'block' : 'none'; safeSet(KEY_PREFS, prefs); });
+
+    // tabs
+    const tabs = document.createElement('div'); tabs.className='cp-tabs'; panel.appendChild(tabs);
+    const sections = {}; const tabEls = [];
+
+    function addTab(key, title, active = false) {
+      const t = document.createElement('div'); t.className='cp-tab'; t.textContent=title; t.dataset.tab=key; tabs.appendChild(t); tabEls.push(t);
+      const s = document.createElement('div'); s.className='cp-section'; s.dataset.section=key; if (active){ t.classList.add('active'); s.classList.add('active'); }
+      panel.appendChild(s); sections[key] = s;
+      t.addEventListener('click', ()=>{ tabEls.forEach(x=>x.classList.remove('active')); Object.values(sections).forEach(x=>x.classList.remove('active')); t.classList.add('active'); s.classList.add('active'); });
+      return s;
+    }
+
+    // basic tabs
+    const typSec = addTab('typography','تایپوگرافی', true);
+    const toolsSec = addTab('tools','ابزارها');
+    const settingsSec = addTab('settings','تنظیمات');
+    const previewSec = addTab('preview','پیش‌نمایش');
+    const helpSec = addTab('help','راهنما');
+    const debugSec = addTab('debug','دیباگ');
+    const pluginsSec = addTab('plugins','پلاگین‌ها');
+    const profilesSec = addTab('profiles','پروفایل‌ها');
+
+    // typography UI
+    typSec.innerHTML = `
+      <div style="display:grid;gap:8px">
+        <label>فونت: <input id="cp-font" type="text" value="${prefs.font}" style="width:100%"></label>
+        <label>اندازه فونت: <input id="cp-font-size" type="number" value="${prefs.fontSize}" min="8" max="72" style="width:100%"></label>
+        <label>فاصله خطوط: <input id="cp-line-height" type="number" step="0.1" value="${prefs.lineHeight}" min="1" max="3" style="width:100%"></label>
+        <label>وزن فونت:
+          <select id="cp-font-weight" style="width:100%">${[100,200,300,400,500,600,700,800,900].map(w=>`<option value="${w}" ${prefs.fontWeight==w?'selected':''}>${w}</option>`).join('')}</select>
+        </label>
+        <label>فاصله حروف:
+          <select id="cp-letter-spacing" style="width:100%">${['normal','0.5px','1px','2px','3px'].map(v=>`<option value="${v}" ${prefs.letterSpacing==v?'selected':''}>${v}</option>`).join('')}</select>
+        </label>
+        <label>تراز متن:
+          <select id="cp-text-align" style="width:100%">${['right','left','justify','center'].map(v=>`<option value="${v}" ${prefs.textAlign==v?'selected':''}>${v}</option>`).join('')}</select>
+        </label>
+        <button id="cp-apply-typography" style="padding:8px">اعمال تایپوگرافی هوشمند</button>
+      </div>
+    `;
+    typSec.querySelector('#cp-apply-typography').addEventListener('click', ()=> applyTypography());
+
+    // tools UI
+    toolsSec.innerHTML = `
+      <button id="cp-refresh-page" style="width:100%;padding:8px;margin-bottom:8px">بازخوانی صفحه</button>
+      <label>انتخاب‌گرهای سفارشی: <textarea id="cp-custom-selectors" style="width:100%;height:80px">${prefs.customSelectors}</textarea></label>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="cp-export-settings" style="flex:1;padding:8px">خروجی تنظیمات</button>
+        <button id="cp-import-settings" style="flex:1;padding:8px">وارد کردن تنظیمات</button>
+      </div>
+      <input id="cp-import-file" type="file" accept=".json" style="display:none">
+    `;
+    toolsSec.querySelector('#cp-refresh-page').addEventListener('click', ()=> location.reload());
+    toolsSec.querySelector('#cp-custom-selectors').addEventListener('change', e=>{ prefs.customSelectors = e.target.value; safeSet(KEY_PREFS, prefs); });
+
+    // settings UI
+    settingsSec.innerHTML = `
+      <label><input type="checkbox" id="cp-auto-apply" ${prefs.autoApply?'checked':''}/> اعمال خودکار تایپوگرافی</label>
+      <label><input type="checkbox" id="cp-live-preview" ${prefs.livePreview?'checked':''}/> پیش‌نمایش زنده</label>
+      <label><input type="checkbox" id="cp-compact-mode" ${prefs.compactMode?'checked':''}/> حالت فشرده</label>
+      <label><input type="checkbox" id="cp-performance-mode" ${prefs.performanceMode?'checked':''}/> حالت عملکرد</label>
+      <div style="margin-top:8px">
+        <label>الگوریتم تشخیص زبان:
+          <select id="cp-language-detection">${['hybrid','character','dictionary'].map(v=>`<option value="${v}" ${prefs.languageDetection===v?'selected':''}>${v}</option>`).join('')}</select>
+        </label>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="cp-reset-settings" style="flex:1;padding:8px">بازنشانی</button>
+        <button id="cp-clear-storage" style="flex:1;padding:8px">پاک کردن storage</button>
+      </div>
+    `;
+    settingsSec.querySelector('#cp-auto-apply').addEventListener('change', e=>{ prefs.autoApply = e.target.checked; safeSet(KEY_PREFS, prefs); });
+    settingsSec.querySelector('#cp-live-preview').addEventListener('change', e=>{ prefs.livePreview = e.target.checked; safeSet(KEY_PREFS, prefs); });
+    settingsSec.querySelector('#cp-compact-mode').addEventListener('change', e=>{ prefs.compactMode = e.target.checked; panel.classList.toggle('compact', prefs.compactMode); safeSet(KEY_PREFS, prefs); });
+    settingsSec.querySelector('#cp-performance-mode').addEventListener('change', e=>{ prefs.performanceMode = e.target.checked; safeSet(KEY_PREFS, prefs); });
+    settingsSec.querySelector('#cp-reset-settings').addEventListener('click', ()=> { if (!confirm('بازنشانی تنظیمات؟')) return; prefs = Object.assign({}, defaultPrefs); safeSet(KEY_PREFS, prefs); location.reload(); });
+    settingsSec.querySelector('#cp-clear-storage').addEventListener('click', ()=> { if (!confirm('پاکسازی داده‌های ذخیره‌شده؟')) return; localStorage.removeItem(KEY_PREFS); localStorage.removeItem(KEY_BTN_POS); localStorage.removeItem(KEY_PANEL_POS); localStorage.removeItem(KEY_PLUGINS); localStorage.removeItem(KEY_PROFILES); location.reload(); });
+
+    // preview
+    previewSec.innerHTML = `
+      <div id="cp-live-preview" class="cp-live-preview">
+        <p>این یک نمونه متن فارسی است برای تست پیش‌نمایش زنده.</p>
+        <p>This is a sample English text for testing live preview.</p>
+      </div>
+      <button id="cp-update-preview" style="width:100%;padding:8px;margin-top:8px">بروزرسانی پیش‌نمایش</button>
+      <textarea id="cp-custom-preview" style="width:100%;height:80px;margin-top:8px">این یک نمونه متن فارسی است.\nThis is a sample English text.</textarea>
+    `;
+    previewSec.querySelector('#cp-update-preview').addEventListener('click', ()=> {
+      const pv = $('#cp-live-preview'); const txt = $('#cp-custom-preview').value; pv.innerHTML=''; txt.split('\n').forEach(line=>{ if (line.trim()){ const p=document.createElement('p'); p.textContent=line; pv.appendChild(p); } }); applyTypography(pv);
+    });
+
+    // help
+    helpSec.innerHTML = `<h3 style="margin-top:0">راهنما</h3><p>برای افزودن پلاگین به تب پلاگین‌ها بروید. پروفایل‌ها را در تب پروفایل‌ها مدیریت کنید.</p>`;
+
+    // debug UI (uses debugTools methods)
+    debugSec.innerHTML = `
+      <h3 style="margin-top:0">ابزارهای دیباگ</h3>
+      <button id="cp-scan-issues" style="width:100%;padding:8px;margin-bottom:8px">اسکن مشکلات</button>
+      <div id="cp-issues-result" style="max-height:200px;overflow:auto;border:1px solid #ddd;padding:8px"></div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="cp-highlight-issues" style="flex:1;padding:8px">هایلایت</button>
+        <button id="cp-fix-all-issues" style="flex:1;padding:8px">رفع خودکار</button>
+        <button id="cp-clear-issues" style="flex:1;padding:8px">پاک کردن فهرست</button>
+      </div>
+      <label style="display:block;margin-top:8px"><input id="cp-auto-scan" type="checkbox" ${prefs.autoScan?'checked':''}/> اسکن خودکار</label>
+    `;
+    debugSec.querySelector('#cp-scan-issues').addEventListener('click', ()=> debugTools.scan());
+    debugSec.querySelector('#cp-highlight-issues').addEventListener('click', ()=> debugTools.highlight());
+    debugSec.querySelector('#cp-fix-all-issues').addEventListener('click', ()=> debugTools.fixAll());
+    debugSec.querySelector('#cp-clear-issues').addEventListener('click', ()=> { debugTools.issues=[]; const out = $('#cp-issues-result'); if (out) out.innerHTML = ''; });
+    debugSec.querySelector('#cp-auto-scan').addEventListener('change', e=>{ prefs.autoScan=e.target.checked; safeSet(KEY_PREFS,prefs); });
+
+    // plugins UI
+    pluginSystem.attachUI(pluginsSec);
+
+    // Profiles UI (new in v6.3)
+    Profiles.initDefaults();
+    function renderProfilesUI() {
+      profilesSec.innerHTML = `
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+          <select id="cp-profile-select" style="flex:1;padding:6px"></select>
+          <button id="cp-profile-new" style="padding:6px">+</button>
+          <button id="cp-profile-save" style="padding:6px">ذخیره</button>
+          <button id="cp-profile-delete" style="padding:6px">حذف</button>
+        </div>
+        <div style="margin-bottom:8px">
+          <label>نام پروفایل: <input id="cp-profile-name" type="text" style="width:100%;padding:6px" /></label>
+        </div>
+        <div style="margin-bottom:8px">
+          <label>دامنه‌ها (هر سطر یک الگو، مثال: *.medium.com): <textarea id="cp-profile-domains" style="width:100%;height:80px;padding:6px"></textarea></label>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <button id="cp-profile-apply" style="padding:8px">اعمال پروفایل</button>
+          <button id="cp-profile-reset" style="padding:8px">بارگذاری تنظیمات پروفایل</button>
+        </div>
+      `;
+      const sel = profilesSec.querySelector('#cp-profile-select');
+      sel.innerHTML = Profiles.list.map(p=>`<option value="${p.id}" ${Profiles.selected===p.id?'selected':''}>${p.name}</option>`).join('');
+      const nameInp = profilesSec.querySelector('#cp-profile-name');
+      const doms = profilesSec.querySelector('#cp-profile-domains');
+
+      function loadSelected() {
+        const id = sel.value;
+        const p = Profiles.list.find(x=>x.id===id);
+        if (!p) return;
+        nameInp.value = p.name || '';
+        doms.value = (p.domains||[]).join('\n');
+      }
+      loadSelected();
+      sel.addEventListener('change', ()=> loadSelected());
+
+      profilesSec.querySelector('#cp-profile-new').addEventListener('click', ()=>{
+        const p = Profiles.create('پروفایل جدید');
+        safeSet(KEY_PROFILES, Profiles.list);
+        renderProfilesUI(); // re-render UI
+      });
+      profilesSec.querySelector('#cp-profile-save').addEventListener('click', ()=>{
+        const id = sel.value;
+        const p = Profiles.list.find(x=>x.id===id);
+        if (!p) return;
+        p.name = nameInp.value || p.name;
+        p.domains = doms.value.split('\n').map(s=>s.trim()).filter(Boolean);
+        // save current prefs snapshot into profile.settings
+        p.settings = Object.assign({}, prefs);
+        safeSet(KEY_PROFILES, Profiles.list);
+        // silently persist
+      });
+      profilesSec.querySelector('#cp-profile-delete').addEventListener('click', ()=>{
+        const id = sel.value;
+        if (!id) return;
+        if (id==='default') { alert('پروفایل پیش‌فرض قابل حذف نیست'); return; }
+        Profiles.delete(id);
+        safeSet(KEY_PROFILES, Profiles.list);
+        renderProfilesUI();
+      });
+      profilesSec.querySelector('#cp-profile-apply').addEventListener('click', ()=>{
+        const id = sel.value; if (!id) return;
+        Profiles.select(id); // applies silently
+      });
+      profilesSec.querySelector('#cp-profile-reset').addEventListener('click', ()=>{
+        const id = sel.value; if (!id) return;
+        const p = Profiles.list.find(x=>x.id===id);
+        if (p) { // load UI fields from profile settings (sync UI widgets)
+          const s = p.settings || {};
+          // set some UI controls to reflect settings
+          if ($('#cp-font')) $('#cp-font').value = s.font || prefs.font;
+          if ($('#cp-font-size')) $('#cp-font-size').value = s.fontSize || prefs.fontSize;
+          if ($('#cp-line-height')) $('#cp-line-height').value = s.lineHeight || prefs.lineHeight;
+          if ($('#cp-font-weight')) $('#cp-font-weight').value = s.fontWeight || prefs.fontWeight;
+          if ($('#cp-letter-spacing')) $('#cp-letter-spacing').value = s.letterSpacing || prefs.letterSpacing;
+          if ($('#cp-text-align')) $('#cp-text-align').value = s.textAlign || prefs.textAlign;
+        }
+      });
+    }
+    renderProfilesUI();
+
+    /* ---------- wire inputs to prefs and UI update ---------- */
+    function updateUIFromPrefs() {
+      try {
+        if ($('#cp-font')) $('#cp-font').value = prefs.font;
+        if ($('#cp-font-size')) $('#cp-font-size').value = prefs.fontSize;
+        if ($('#cp-line-height')) $('#cp-line-height').value = prefs.lineHeight;
+        if ($('#cp-font-weight')) $('#cp-font-weight').value = prefs.fontWeight;
+        if ($('#cp-letter-spacing')) $('#cp-letter-spacing').value = prefs.letterSpacing;
+        if ($('#cp-text-align')) $('#cp-text-align').value = prefs.textAlign;
+      } catch (e) {}
+    }
+    updateUIFromPrefs();
+
+    // inputs binding
+    panel.querySelectorAll('input,select,textarea').forEach(inp=>{
+      inp.addEventListener('mousedown', e=>e.stopPropagation()); // prevent drag start on inputs
+      inp.addEventListener('click', e=>e.stopPropagation());
+    });
+
+    if ($('#cp-font')) $('#cp-font').addEventListener('input', e=>{ prefs.font = e.target.value; panel.style.fontFamily = prefs.font; safeSet(KEY_PREFS,prefs); if (prefs.livePreview) { const pv = $('#cp-live-preview'); if (pv) applyTypography(pv); } });
+    if ($('#cp-font-size')) $('#cp-font-size').addEventListener('input', e=>{ const v=+e.target.value; if (v>=8&&v<=72){ prefs.fontSize=v; panel.style.fontSize=v+'px'; safeSet(KEY_PREFS,prefs); if (prefs.livePreview){ const pv = $('#cp-live-preview'); if (pv) applyTypography(pv); } }});
+    if ($('#cp-line-height')) $('#cp-line-height').addEventListener('input', e=>{ const v=+e.target.value; if (v>=1&&v<=3){ prefs.lineHeight=v; panel.style.lineHeight=v; safeSet(KEY_PREFS,prefs); if (prefs.livePreview){ const pv = $('#cp-live-preview'); if (pv) applyTypography(pv); } }});
+    if ($('#cp-font-weight')) $('#cp-font-weight').addEventListener('change', e=>{ prefs.fontWeight=+e.target.value; safeSet(KEY_PREFS,prefs); });
+    if ($('#cp-letter-spacing')) $('#cp-letter-spacing').addEventListener('change', e=>{ prefs.letterSpacing=e.target.value; safeSet(KEY_PREFS,prefs); });
+    if ($('#cp-text-align')) $('#cp-text-align').addEventListener('change', e=>{ prefs.textAlign=e.target.value; safeSet(KEY_PREFS,prefs); });
+
+    // initial typography & plugin restore
+    pluginSystem.init({ panel, tabs, sections, tabEls });
+    pluginSystem.restore && pluginSystem.restore();
+    applyTypography(document);
+
+    // MutationObserver optimized
+    const observer = new MutationObserver(muts=>{
+      const added = [];
+      for (const m of muts) {
+        for (const n of (m.addedNodes||[])) { if (n.nodeType===1 && (!n.closest || !n.closest('#cp-panel'))) added.push(n); }
+        if (m.type==='characterData' && m.target && m.target.parentElement) added.push(m.target.parentElement);
+      }
+      if (!added.length) return;
+      if (prefs.performanceMode) { clearTimeout(observer._deb); observer._deb = setTimeout(()=>{ for (const n of added) try{ applyTypography(n); }catch{} }, 200); }
+      else for (const n of added) try{ applyTypography(n); }catch{};
+      if (prefs.autoScan) debugTools.scan();
+    });
+    observer.observe(document.body, { childList:true, subtree:true, characterData:true });
+
+    // Auto-apply profile by domain (silent)
+    (function autoPickProfile() {
+      Profiles.initDefaults();
+      const hn = location.hostname || '';
+      const matched = Profiles.matchDomain(hn);
+      if (matched) {
+        Profiles.applyProfile(matched); // silent
+        Profiles.selected = matched.id; safeSet(KEY_SELECTED_PROFILE, Profiles.selected);
+      } else {
+        // if user previously selected a profile, apply it
+        const sel = safeGet(KEY_SELECTED_PROFILE, null);
+        if (sel) { const p = Profiles.list.find(x=>x.id===sel); if (p) Profiles.applyProfile(p); }
+      }
+    })();
+
+    console.log('[Copilot Persian Display Enhancer v6.3] loaded');
+  } // end createPanel
+
+  // create panel on DOM ready
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', createPanel);
+  else createPanel();
+
+})();
